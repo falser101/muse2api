@@ -1,5 +1,6 @@
 """账号集合选号、额度差和任务用量，不访问网络。"""
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,3 +110,79 @@ def test_usage_delta_and_task_record(tmp_path):
     assert saved["usage"]["account"] == "acc"
     assert saved["usage"]["weekly_delta_pct"] == 1
     assert st.get_task(task["id"])["usage"]["extra_delta_tokens"] == 100000
+
+
+def _use_store(st):
+    previous = app.store
+    app.store = st
+    return previous
+
+
+def _subscription(percent, extra):
+    return {
+        "found": True,
+        "weekly_used_pct": percent,
+        "weekly_resets_at": 1795200008,
+        "extra_balance": extra,
+        "quota_status": "SUFFICIENT",
+    }
+
+
+def test_meter_uses_explicit_before_not_stale_cache(tmp_path, monkeypatch):
+    st = _store(tmp_path)
+    acc = _account("acc", 0, 1)
+    acc["quota"].update({"extra_balance": 1, "weekly_resets_at": 1795200008, "checked_at": 1})
+    st.accounts = [acc]
+    previous = _use_store(st)
+    monkeypatch.setattr(app.engine, "read_subscription", lambda *args, **kwargs: _subscription(12, 80))
+    try:
+        usage = app._meter_account(st.get_account("acc"), {
+            "weekly_used_pct": 11, "weekly_resets_at": 1795200008, "extra_balance": 90,
+        })
+        assert usage["weekly_delta_pct"] == 1
+        assert usage["extra_delta_tokens"] == 10
+
+        stale = st.get_account("acc")
+        stale["quota"]["checked_at"] = 1
+        st.update_account("acc", quota=stale["quota"])
+        missed = app._meter_account(st.get_account("acc"))
+        assert missed["weekly_used_pct_after"] == 12
+        assert "weekly_delta_pct" not in missed
+        assert "extra_delta_tokens" not in missed
+
+        fresh = st.get_account("acc")
+        fresh["quota"]["weekly_used_pct"] = 10
+        fresh["quota"]["extra_balance"] = 100
+        fresh["quota"]["checked_at"] = int(time.time())
+        st.update_account("acc", quota=fresh["quota"])
+        cached = app._meter_account(st.get_account("acc"))
+        assert cached["weekly_delta_pct"] == 2
+        assert cached["extra_delta_tokens"] == 20
+    finally:
+        app.store = previous
+
+
+def test_quota_fallback_skips_browser(tmp_path, monkeypatch):
+    st = _store(tmp_path)
+    acc = _account("acc", 0, 8)
+    st.accounts = [acc]
+    previous = _use_store(st)
+
+    def unavailable(*args, **kwargs):
+        raise app.MuseGenerationError("down")
+
+    def browser(*args, **kwargs):
+        raise AssertionError("browser quota path should not run")
+
+    monkeypatch.setattr(app.engine, "read_subscription", unavailable)
+    monkeypatch.setattr(app.engine, "quota", browser)
+    try:
+        try:
+            app._probe_quota("acc", "0")
+        except app.MuseGenerationError as exc:
+            assert "额度接口不可用" in str(exc)
+        else:
+            raise AssertionError("http failure should surface")
+        assert st.get_account("acc")["quota"]["weekly_used_pct"] == 8
+    finally:
+        app.store = previous

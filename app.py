@@ -242,14 +242,39 @@ def _pick_scoped_account(allowed: list[str] | None) -> dict:
     raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
 
-def _meter_account(acc: dict | None) -> dict | None:
+def _quota_snapshot(acc: dict | None) -> dict | None:
+    """Read subscription before a scoped request. A failure keeps the previous cache."""
+    if not acc or not acc.get("id") or not acc.get("cookies"):
+        return None
+    try:
+        quota = engine.read_subscription(
+            acc["cookies"], acc.get("cookies_exp"), proxy=_account_proxy(acc) or acc.get("proxy"))
+    except Exception as exc:  # noqa: BLE001
+        log.info("生成前读取账号 %s 额度失败: %s", acc.get("id"), type(exc).__name__)
+        return None
+    quota["checked_at"] = int(time.time())
+    store.update_account(acc["id"], quota=quota, quota_exhausted=engine.quota_exhausted(quota))
+    return quota
+
+
+def _fresh_quota(quota: dict | None, max_age: float = 120) -> dict | None:
+    quota = quota or {}
+    checked = quota.get("checked_at")
+    if isinstance(checked, (int, float)) and time.time() - float(checked) <= max_age:
+        return quota
+    return None
+
+
+def _meter_account(acc: dict | None, before: dict | None = None) -> dict | None:
     """Read the subscription after a successful call and store the delta.
 
-    The HTTP read is about a second. A failure leaves the previous cache in place.
+    An explicit before wins. Otherwise a cache younger than 120 seconds can
+    stand in. An older cache is not a baseline: the delta is omitted.
     """
     if not acc or not acc.get("id") or not acc.get("cookies"):
         return None
-    before = acc.get("quota") or {}
+    if before is None:
+        before = _fresh_quota(acc.get("quota"))
     try:
         after = engine.read_subscription(
             acc["cookies"], acc.get("cookies_exp"), proxy=_account_proxy(acc) or acc.get("proxy"))
@@ -258,7 +283,11 @@ def _meter_account(acc: dict | None) -> dict | None:
         return None
     after["checked_at"] = int(time.time())
     store.update_account(acc["id"], quota=after, quota_exhausted=engine.quota_exhausted(after))
-    return engine.usage_delta(acc["id"], before, after)
+    usage = engine.usage_delta(acc["id"], before or {}, after)
+    if before is None:
+        usage.pop("weekly_delta_pct", None)
+        usage.pop("extra_delta_tokens", None)
+    return usage
 IMAGE_TASK_LOCK = threading.Lock()
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -524,6 +553,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             cur_exp = refreshed.get("cookies_exp")
                     if stop_event.is_set():
                         return
+                    before = None
+                    if cur_id and allowed_ids is not None:
+                        before = _quota_snapshot(store.get_account(cur_id) or {
+                            "id": cur_id, "cookies": cur_cookies, "cookies_exp": cur_exp})
                     engine.start()
                     for chunk in engine.chat_stream(
                         cur_cookies, prompt, cur_exp, timeout,
@@ -537,7 +570,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
                         usage = _meter_account(store.get_account(cur_id) or {
-                            "id": cur_id, "cookies": cur_cookies, "cookies_exp": cur_exp})
+                            "id": cur_id, "cookies": cur_cookies, "cookies_exp": cur_exp}, before)
                         if usage:
                             q.put(("usage", usage))
                     return
@@ -1316,6 +1349,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
                 if refreshed:
                     cur_acc = refreshed
+                before = _quota_snapshot(cur_acc) if allowed_ids is not None else None
                 engine.start()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1332,7 +1366,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
-                usage = _meter_account(cur_acc)
+                usage = _meter_account(cur_acc, before)
                 if on_usage:
                     on_usage(usage)
                 return res, cur_acc["id"]
@@ -2354,14 +2388,8 @@ def relogin(_=Depends(auth)):
 
 
 # ------------------------- 管理：额度 -------------------------
-@app.post("/admin/accounts/{aid}/quota")
-async def query_quota(aid: str, _=Depends(auth)):
-    """打开 muse.ai 的 Settings 面板读该账号的额度（实时），并缓存到账号记录。
-
-    返回例：{"plan":"Free plan","weekly_reset":"Sep 30",
-             "weekly_used_pct":1,"extra_left":"2B tokens left",
-             "extra_used_pct":0,"extra_expires":"never"}
-    """
+def _probe_quota(aid: str, fallback: str | None = None) -> dict:
+    """Read one account's quota. fallback=0 stays on HTTP and never opens the browser."""
     acc = store.get_account(aid)
     if not acc:
         raise HTTPException(404, "账号不存在")
@@ -2373,24 +2401,36 @@ async def query_quota(aid: str, _=Depends(auth)):
         store.update_account(aid, quota=q, quota_exhausted=engine.quota_exhausted(q))
         return q
 
-    def _probe():
-        current = store.get_account(aid) or acc
-        try:
-            return _save_quota(engine.read_subscription(
-                current["cookies"], current.get("cookies_exp"), proxy=current.get("proxy")))
-        except MuseAuthError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.info("账号 %s 的额度接口不可用，改读设置面板: %s", aid, type(exc).__name__)
-        with GEN_LOCK, _account_operation(aid) as current:
-            engine.start()
-            q = engine.quota(current["cookies"], current.get("cookies_exp"), account_id=aid)
-            if not q.get("found"):
-                raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
-            return _save_quota(q)
-
+    current = store.get_account(aid) or acc
     try:
-        return await asyncio.to_thread(_probe)
+        return _save_quota(engine.read_subscription(
+            current["cookies"], current.get("cookies_exp"), proxy=current.get("proxy")))
+    except MuseAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if str(fallback) == "0":
+            log.info("账号 %s 的额度接口不可用: %s", aid, type(exc).__name__)
+            raise MuseGenerationError("额度接口不可用") from exc
+        log.info("账号 %s 的额度接口不可用，改读设置面板: %s", aid, type(exc).__name__)
+    with GEN_LOCK, _account_operation(aid) as current:
+        engine.start()
+        q = engine.quota(current["cookies"], current.get("cookies_exp"), account_id=aid)
+        if not q.get("found"):
+            raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
+        return _save_quota(q)
+
+
+@app.post("/admin/accounts/{aid}/quota")
+async def query_quota(aid: str, fallback: str | None = None, _=Depends(auth)):
+    """打开 muse.ai 的 Settings 面板读该账号的额度（实时），并缓存到账号记录。
+
+    fallback=0 时只请求额度接口，失败不覆盖缓存，也不占用浏览器。
+    返回例：{"plan":"Free plan","weekly_reset":"Sep 30",
+             "weekly_used_pct":1,"extra_left":"2B tokens left",
+             "extra_used_pct":0,"extra_expires":"never"}
+    """
+    try:
+        return await asyncio.to_thread(_probe_quota, aid, fallback)
     except HTTPException:
         raise
     except MuseAuthError as exc:
