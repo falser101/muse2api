@@ -142,8 +142,10 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float | None = 60.0, record_use: bool = True) -> dict:
+                timeout: float | None = 60.0, record_use: bool = True,
+                allowed_ids: set[str] | list[str] | None = None) -> dict:
         deadline = None if timeout is None else time.monotonic() + timeout
+        allow = None if allowed_ids is None else {str(item) for item in allowed_ids}
         with self.cond:
             while True:
                 remaining = None if deadline is None else deadline - time.monotonic()
@@ -151,28 +153,41 @@ class AccountPoolManager:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
 
                 if account_id:
+                    if allow is not None and account_id not in allow:
+                        raise MuseAuthError(f"指定账号 {account_id} 不在允许范围内")
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
+                    if allow is not None and acc.get("quota_exhausted"):
+                        raise MuseGenerationError("指定账号额度已用完")
                     if account_id not in self.busy_accounts:
                         self.busy_accounts.add(account_id)
                         return acc
                 else:
                     pref = preferred_id if preferred_id not in self.busy_accounts else None
-                    acc = self.store.pick_account(
-                        preferred_id=pref,
-                        rotate=rotate,
-                        force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
-                        record_use=record_use,
-                    )
+                    pick_args = {
+                        "preferred_id": pref,
+                        "rotate": rotate,
+                        "force_rotate": force_rotate,
+                        "exclude_ids": self.busy_accounts,
+                        "record_use": record_use,
+                    }
+                    if allow is not None:
+                        pick_args["allowed_ids"] = allow
+                    acc = self.store.pick_account(**pick_args)
                     if acc:
                         self.busy_accounts.add(acc["id"])
                         return acc
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
+                if allow is not None:
+                    live = [a for a in live if a["id"] in allow]
                 if not live:
+                    if allow is not None:
+                        raise MuseAuthError("指定账号不存在或已禁用")
                     raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
+                if allow is not None and all(a.get("quota_exhausted") for a in live):
+                    raise MuseGenerationError("指定账号额度已用完")
 
                 self.cond.wait(timeout=0.5 if remaining is None else min(remaining, 0.5))
 
@@ -186,6 +201,64 @@ class AccountPoolManager:
 
 GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
 ACCOUNT_POOL = AccountPoolManager(store)
+
+_ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def parse_account_header(raw: str | None) -> list[str] | None:
+    """X-Muse-Accounts limits a request to these muse2api account ids.
+
+    Missing or blank means the existing whole-pool behavior.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    ids: list[str] = []
+    for part in str(raw).split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if not _ACCOUNT_ID_RE.fullmatch(item):
+            raise HTTPException(400, "X-Muse-Accounts 含有无效账号 id")
+        if item not in ids:
+            ids.append(item)
+    if not ids:
+        raise HTTPException(400, "X-Muse-Accounts 没有有效账号")
+    return ids
+
+
+def _pick_scoped_account(allowed: list[str] | None) -> dict:
+    if allowed:
+        acc = store.pick_account(rotate=True, allowed_ids=allowed)
+    else:
+        acc = store.pick_account(rotate=True)
+    if acc:
+        return acc
+    if allowed:
+        known = [a for a in store.accounts
+                 if a["id"] in set(allowed) and a.get("enabled", True) and a.get("cookies")]
+        if known and all(a.get("quota_exhausted") for a in known):
+            raise HTTPException(402, "指定账号额度已用完")
+        raise HTTPException(400, "指定账号不存在或已禁用")
+    raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+
+
+def _meter_account(acc: dict | None) -> dict | None:
+    """Read the subscription after a successful call and store the delta.
+
+    The HTTP read is about a second. A failure leaves the previous cache in place.
+    """
+    if not acc or not acc.get("id") or not acc.get("cookies"):
+        return None
+    before = acc.get("quota") or {}
+    try:
+        after = engine.read_subscription(
+            acc["cookies"], acc.get("cookies_exp"), proxy=_account_proxy(acc) or acc.get("proxy"))
+    except Exception as exc:  # noqa: BLE001
+        log.info("读取账号 %s 额度失败: %s", acc.get("id"), type(exc).__name__)
+        return None
+    after["checked_at"] = int(time.time())
+    store.update_account(acc["id"], quota=after, quota_exhausted=engine.quota_exhausted(after))
+    return engine.usage_delta(acc["id"], before, after)
 IMAGE_TASK_LOCK = threading.Lock()
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -394,11 +467,13 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     allowed_ids: list[str] | None = None):
     """Acquire a generation slot before the account lease; release both after cleanup."""
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
+    usage_holder: dict = {}
 
     def worker():
         cur_id = account_id
@@ -420,7 +495,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         ACCOUNT_POOL.release(leased_id)
                         leased_id = None
                     try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
+                        retry_args = {"rotate": True, "force_rotate": True, "timeout": timeout}
+                        if allowed_ids is not None:
+                            retry_args["allowed_ids"] = allowed_ids
+                        alt = ACCOUNT_POOL.acquire(**retry_args)
                     except Exception:
                         break
                     if not alt or alt["id"] == cur_id:
@@ -433,7 +511,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     cur_exp = alt.get("cookies_exp")
                     log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
                 elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
+                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout, allowed_ids=allowed_ids)
                     leased_id = cur_id
 
                 yielded = False
@@ -458,6 +536,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
+                        usage = _meter_account(store.get_account(cur_id) or {
+                            "id": cur_id, "cookies": cur_cookies, "cookies_exp": cur_exp})
+                        if usage:
+                            q.put(("usage", usage))
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
@@ -495,17 +577,31 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 
     threading.Thread(target=worker, daemon=True).start()
 
-    try:
-        while True:
-            kind, val = q.get()
-            if kind == "data":
-                yield val
-            elif kind == "error":
-                raise val
-            else:
-                break
-    finally:
-        stop_event.set()
+    def generate():
+        try:
+            while True:
+                kind, val = q.get()
+                if kind == "data":
+                    yield val
+                elif kind == "usage":
+                    usage_holder["usage"] = val
+                elif kind == "error":
+                    raise val
+                else:
+                    break
+        finally:
+            stop_event.set()
+
+    stream = generate()
+    stream.muse_usage = usage_holder  # type: ignore[attr-defined]
+    return stream
+
+
+def _chat_usage(stream):
+    holder = getattr(stream, "muse_usage", None)
+    if isinstance(holder, dict):
+        return holder.get("usage")
+    return None
 
 
 class ImageRequest(BaseModel):
@@ -1142,7 +1238,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    on_acquired=None, on_account=None, on_queue=None, on_error=None) -> tuple[dict, str | None]:
+                    on_acquired=None, on_account=None, on_queue=None, on_error=None,
+                    allowed_ids: list[str] | None = None, on_usage=None) -> tuple[dict, str | None]:
     if not any(a.get("enabled", True) and a.get("cookies") for a in store.accounts):
         raise MuseGenerationError("没有可用的生成账号，请检查账号池")
     queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
@@ -1157,7 +1254,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                                       on_progress, reference_image, reference_images,
                                       on_acquired=on_acquired, on_account=on_account,
                                       on_queue=on_queue, on_error=on_error,
-                                      queued=queued, queue_timeout=queue_timeout)
+                                      queued=queued, queue_timeout=queue_timeout,
+                                      allowed_ids=allowed_ids, on_usage=on_usage)
     finally:
         GEN_LOCK.release()
 
@@ -1167,7 +1265,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
                     deadline=None, on_acquired=None, on_account=None,
-                    on_queue=None, on_error=None, queued=0.0, queue_timeout=None) -> tuple[dict, str | None]:
+                    on_queue=None, on_error=None, queued=0.0, queue_timeout=None,
+                    allowed_ids: list[str] | None = None, on_usage=None) -> tuple[dict, str | None]:
     if queue_timeout is None:
         queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
 
@@ -1185,7 +1284,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 deadline += waited
             _generation_callback(on_queue, queued)
 
-    cur_acc = lease(account_id=account_id, preferred_id=None, rotate=True)
+    scope = {"allowed_ids": allowed_ids} if allowed_ids is not None else {}
+    cur_acc = lease(account_id=account_id, preferred_id=None, rotate=True, **scope)
     if deadline is None:
         deadline = time.monotonic() + max(1, timeout)
     last_exc = None
@@ -1204,7 +1304,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     ACCOUNT_POOL.release(old_id)
                 cur_acc = None
                 try:
-                    alt = lease(rotate=True, force_rotate=True)
+                    alt = lease(rotate=True, force_rotate=True, **scope)
                 except (MuseAuthError, MuseGenerationError):
                     raise last_exc
                 cur_acc = alt
@@ -1232,6 +1332,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
+                usage = _meter_account(cur_acc)
+                if on_usage:
+                    on_usage(usage)
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
@@ -1243,6 +1346,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 engine.close_current_page()
             except MuseGenerationError as exc:
                 last_exc = exc
+                if "额度不足" in str(exc):
+                    store.update_account(cur_acc["id"], quota_exhausted=True)
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:200]}")
                 try:
                     engine.reset_thread()
@@ -1281,6 +1386,23 @@ def models(_=Depends(auth)):
 
 
 # ------------------------- 生图 -------------------------
+def _generate_for_response(req: ImageRequest, prompt: str, kind: str, timeout: int,
+                           reference_images: list[str], allowed: list[str] | None):
+    usage_box: dict = {}
+
+    def _on_usage(usage):
+        if usage:
+            usage_box["usage"] = usage
+
+    res, _acc = _run_generation(
+        prompt, kind, timeout, reference_images=reference_images,
+        allowed_ids=allowed, on_usage=_on_usage)
+    body = _image_response(req, res)
+    if usage_box.get("usage"):
+        body["usage"] = usage_box["usage"]
+    return res, body
+
+
 def _image_response(req: ImageRequest, res: dict) -> dict:
     item = {"revised_prompt": req.prompt, "url": media_url(res["filename"]),
             "size": req.size or "auto", "kind": res["kind"], "bytes": res["size"]}
@@ -1318,7 +1440,7 @@ def _prepare_reference_images(images: list[str]) -> list[str]:
 
 
 def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
-                 idempotency_key: str | None = None):
+                 idempotency_key: str | None = None, allowed_ids: list[str] | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
@@ -1354,15 +1476,22 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
             timing.acquired()
             store.update_task(tid, progress=5)
         try:
+            usage_box: dict = {}
+
+            def _on_usage(usage):
+                if usage:
+                    usage_box["usage"] = usage
+
             res, acc_id = _run_generation(
                 prompt, "image", req.timeout or CFG.image_timeout,
                 reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
                 on_acquired=_on_acquired, on_account=timing.account,
-                on_queue=timing.queued, on_error=timing.error)
+                on_queue=timing.queued, on_error=timing.error,
+                allowed_ids=allowed_ids, on_usage=_on_usage)
             # Store only media metadata, not large base64 payloads or reference credentials.
             store.update_task(tid, status="completed", progress=100, account=acc_id,
-                              **timing.finish(),
+                              **timing.finish(), **usage_box,
                               url=media_url(res["filename"]),
                               result={**{k: res[k] for k in ("filename", "size", "kind")},
                                       "url": media_url(res["filename"])})
@@ -1378,9 +1507,12 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
 
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
-                      idempotency_key: str | None = Header(default=None), _=Depends(auth)):
+                      idempotency_key: str | None = Header(default=None),
+                      x_muse_accounts: str | None = Header(default=None, alias="X-Muse-Accounts"),
+                      _=Depends(auth)):
     refs = _prepare_reference_images(_image_references(req))
-    return _queue_image(req, build_image_prompt(req, _reference_kinds(refs)), refs, idempotency_key)
+    return _queue_image(req, build_image_prompt(req, _reference_kinds(refs)), refs,
+                        idempotency_key, parse_account_header(x_muse_accounts))
 
 
 @app.get("/v1/images/tasks/{task_id}")
@@ -1397,22 +1529,25 @@ def get_image_task(task_id: str, _=Depends(auth)):
 
 
 @app.post("/v1/images/generations")
-async def images_generations(req: ImageRequest, _=Depends(auth)):
+async def images_generations(req: ImageRequest,
+                             x_muse_accounts: str | None = Header(default=None, alias="X-Muse-Accounts"),
+                             _=Depends(auth)):
+    allowed = parse_account_header(x_muse_accounts)
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _image_references(req))
 
     prompt = build_image_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.image_timeout
     if req.async_:
-        return _queue_image(req, prompt, ref_images)
+        return _queue_image(req, prompt, ref_images, allowed_ids=allowed)
     try:
-        res, _acc = await asyncio.to_thread(
-            _run_generation, prompt, "image", timeout, reference_images=ref_images)
+        res, body = await asyncio.to_thread(
+            _generate_for_response, req, prompt, "image", timeout, ref_images, allowed)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
-    return _image_response(req, res)
+    return body
 
 
 @app.post("/v1/images/edits")
@@ -1501,24 +1636,27 @@ async def images_edits(request: Request, _=Depends(auth)):
         _prepare_reference_images, ref_image_data)
     full_prompt = build_image_prompt(req_obj, _reference_kinds(ref_image_data))
     gen_timeout = timeout or CFG.image_timeout
+    allowed = parse_account_header(request.headers.get("x-muse-accounts"))
     if req_obj.async_:
-        return _queue_image(req_obj, full_prompt, ref_image_data)
+        return _queue_image(req_obj, full_prompt, ref_image_data, allowed_ids=allowed)
     try:
-        res, _acc = await asyncio.to_thread(
-            _run_generation, full_prompt, "image", gen_timeout,
-            reference_images=ref_image_data)
+        _res, body = await asyncio.to_thread(
+            _generate_for_response, req_obj, full_prompt, "image", gen_timeout, ref_image_data, allowed)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    return _image_response(req_obj, res)
+    return body
 
 
 # ------------------------- 生视频（异步任务） -------------------------
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
-async def create_video(req: VideoRequest, _=Depends(auth)):
+async def create_video(req: VideoRequest,
+                       x_muse_accounts: str | None = Header(default=None, alias="X-Muse-Accounts"),
+                       _=Depends(auth)):
+    allowed = parse_account_header(x_muse_accounts)
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _video_references(req))
 
@@ -1537,12 +1675,19 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
         try:
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
+            usage_box: dict = {}
+
+            def _on_usage(usage):
+                if usage:
+                    usage_box["usage"] = usage
+
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired, on_account=timing.account,
-                on_queue=timing.queued, on_error=timing.error)
+                on_queue=timing.queued, on_error=timing.error,
+                allowed_ids=allowed, on_usage=_on_usage)
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
-                              **timing.finish(),
+                              **timing.finish(), **usage_box,
                               url=vurl,
                               video={"url": vurl},
                               result={"url": vurl,
@@ -1627,7 +1772,9 @@ _SSE_HEADERS = {
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, _=Depends(auth)):
+async def chat_completions(req: ChatRequest,
+                           x_muse_accounts: str | None = Header(default=None, alias="X-Muse-Accounts"),
+                           _=Depends(auth)):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
     说明：muse.ai 网页是**自动路由**的 agent，界面上没有模型选择器，所有请求
@@ -1653,9 +1800,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    allowed = parse_account_header(x_muse_accounts)
+    acc = _pick_scoped_account(allowed)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -1678,7 +1824,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                                              allowed_ids=allowed)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1723,6 +1870,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                                 "created": created, "model": model,
                                 "choices": [],
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                muse = _chat_usage(stream_gen)
+                if muse:
+                    yield _sse({"muse_usage": muse})
                 yield "data: [DONE]\n\n"
                 store.mark(acc_id, True, "")
             except MuseAuthError as exc:
@@ -1739,11 +1889,13 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+    def run():
+        gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                               allowed_ids=allowed)
+        return "".join(gen), _chat_usage(gen)
 
     try:
-        text = await asyncio.to_thread(run)
+        text, muse = await asyncio.to_thread(run)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
@@ -1753,18 +1905,24 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     if tool_note:
         calls, rest = parse_tool_calls(text)
         if calls:
-            return {"id": cid, "object": "chat.completion", "created": created,
+            body = {"id": cid, "object": "chat.completion", "created": created,
                     "model": model,
                     "choices": [{"index": 0, "finish_reason": "tool_calls",
                                  "message": {"role": "assistant",
                                              "content": rest or None,
                                              "tool_calls": calls}}],
                     "usage": usage}
-    return {"id": cid, "object": "chat.completion", "created": created,
+            if muse:
+                body["muse_usage"] = muse
+            return body
+    body = {"id": cid, "object": "chat.completion", "created": created,
             "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": text}}],
             "usage": usage}
+    if muse:
+        body["muse_usage"] = muse
+    return body
 
 
 def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:
@@ -1803,7 +1961,9 @@ def _sse_event(event: str, data: dict) -> str:
 
 
 @app.post("/v1/responses")
-async def responses_api(req: ResponsesRequest, _=Depends(auth)):
+async def responses_api(req: ResponsesRequest,
+                        x_muse_accounts: str | None = Header(default=None, alias="X-Muse-Accounts"),
+                        _=Depends(auth)):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
     只实现 Codex 实际用到的子集：文本进 → 文本出（含流式事件）。
@@ -1815,9 +1975,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    allowed = parse_account_header(x_muse_accounts)
+    acc = _pick_scoped_account(allowed)
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
@@ -1851,7 +2010,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                                              allowed_ids=allowed)
+                for chunk in stream_gen:
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1865,9 +2026,13 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                              "status": "completed",
                              "content": [{"type": "output_text", "text": full,
                                           "annotations": []}]}})
+                completed = envelope("completed", full)
+                muse = _chat_usage(stream_gen)
+                if muse:
+                    completed["muse_usage"] = muse
                 yield _sse_event("response.completed", {
                     "type": "response.completed",
-                    "response": envelope("completed", full)})
+                    "response": completed})
             except Exception as exc:  # noqa: BLE001
                 log.warning("responses 流式失败: %s", exc)
                 yield _sse_event("response.failed", {
@@ -1875,17 +2040,22 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "response": envelope("failed")})
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+    def run():
+        gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                               allowed_ids=allowed)
+        return "".join(gen), _chat_usage(gen)
 
     try:
-        text = await asyncio.to_thread(run)
+        text, muse = await asyncio.to_thread(run)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc))
 
-    return envelope("completed", text)
+    body = envelope("completed", text)
+    if muse:
+        body["muse_usage"] = muse
+    return body
 
 
 @app.get("/v1/media/{name}")
@@ -2198,15 +2368,26 @@ async def query_quota(aid: str, _=Depends(auth)):
     if not acc.get("cookies"):
         raise HTTPException(400, "该账号没有 cookie")
 
+    def _save_quota(q: dict) -> dict:
+        q["checked_at"] = int(time.time())
+        store.update_account(aid, quota=q, quota_exhausted=engine.quota_exhausted(q))
+        return q
+
     def _probe():
-        with GEN_LOCK, _account_operation(aid) as acc:
+        current = store.get_account(aid) or acc
+        try:
+            return _save_quota(engine.read_subscription(
+                current["cookies"], current.get("cookies_exp"), proxy=current.get("proxy")))
+        except MuseAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.info("账号 %s 的额度接口不可用，改读设置面板: %s", aid, type(exc).__name__)
+        with GEN_LOCK, _account_operation(aid) as current:
             engine.start()
-            q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            q = engine.quota(current["cookies"], current.get("cookies_exp"), account_id=aid)
             if not q.get("found"):
                 raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
-            q["checked_at"] = int(time.time())
-            store.update_account(aid, quota=q)
-            return q
+            return _save_quota(q)
 
     try:
         return await asyncio.to_thread(_probe)

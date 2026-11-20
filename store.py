@@ -156,11 +156,21 @@ class Store:
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None,
                      exclude_ids: set[str] | list[str] | None = None,
-                     record_use: bool = True) -> dict | None:
+                     record_use: bool = True,
+                     allowed_ids: set[str] | list[str] | None = None) -> dict | None:
         """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。
-        exclude_ids: 需要排除的账号 ID 集合（例如正在被其他并发线程占用的账号）。"""
+        exclude_ids: 需要排除的账号 ID 集合（例如正在被其他并发线程占用的账号）。
+        allowed_ids: 只在这组账号里选，并跳过已标记额度耗尽的账号，优先用每周用量更低的。
+        不传时保持原来的选择顺序。"""
         with _LOCK:
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+            if allowed_ids is not None:
+                allow = {str(item) for item in allowed_ids}
+                live = [a for a in live if a["id"] in allow]
+                usable = [a for a in live if not a.get("quota_exhausted")]
+                if not usable:
+                    return None
+                live = usable
             if not live:
                 return None
             blocked = set(exclude_ids or [])
@@ -187,7 +197,17 @@ class Store:
                         return a
             healthy = [a for a in live if a.get("ok") is not False]
             candidates = healthy if healthy else live
-            candidates.sort(key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
+            if allowed_ids is not None:
+                def _quota_rank(account: dict):
+                    quota = account.get("quota") or {}
+                    try:
+                        percent = float(quota.get("weekly_used_pct"))
+                    except (TypeError, ValueError):
+                        percent = 0.0
+                    return (percent, account.get("last_used") or 0.0, account.get("use_count") or 0)
+                candidates.sort(key=_quota_rank)
+            else:
+                candidates.sort(key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
             acc = candidates[0]
             self._sticky_id = acc["id"]
             self._sticky_count = 1

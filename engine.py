@@ -310,6 +310,30 @@ def _open_public_ref_image(url: str):
     raise urllib.error.URLError("参考图重定向次数过多")
 
 
+def _finite_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _whole_number(value):
+    number = _finite_number(value)
+    if number is None:
+        return None
+    return int(number)
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -959,6 +983,7 @@ class MuseEngine:
             while True:
                 parsed = self._parse_quota(self.page.js(self._QUOTA_DIALOG_JS) or '')
                 if parsed['found']:
+                    self._remember_action_from_page()
                     return parsed
                 if time.monotonic() >= deadline:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
@@ -1024,6 +1049,236 @@ class MuseEngine:
             out['extra_expires'] = 'never'
         # A plan label alone is not a successful quota read. Preserve old cache.
         out['found'] = 'weekly_used_pct' in out
+        return out
+
+    # Muse renders Usage from a Next.js server action, not from the DOM text.
+    # The action returns weekly percentUsed plus integer topupBalance/topupTotal.
+    # The action id is content-addressed and changes when Muse deploys; a working
+    # id is cached in data/quota-action.json and can be overridden.
+    _SUBSCRIPTION_ACTION_RE = re.compile(
+        r'createServerReference\)\("([0-9a-f]{40,})"[\s\S]{0,180}?fetchSubscriptionAction'
+    )
+    _SUBSCRIPTION_ACTION_SEED = "40e0249eeae158685b6a8d0c3b203f53dd4f2c7d63"
+
+    def _action_id_path(self) -> str:
+        return os.path.join(self.cfg.data_dir, "quota-action.json")
+
+    def _load_action_id(self) -> str:
+        override = os.environ.get("MUSE2API_SUBSCRIPTION_ACTION", "").strip()
+        if re.fullmatch(r"[0-9a-f]{40,}", override):
+            return override
+        try:
+            with open(self._action_id_path(), encoding="utf-8") as fh:
+                saved = json.load(fh).get("id") or ""
+            if re.fullmatch(r"[0-9a-f]{40,}", saved):
+                return saved
+        except (OSError, ValueError, TypeError):
+            pass
+        return self._SUBSCRIPTION_ACTION_SEED
+
+    def _save_action_id(self, action_id: str):
+        if os.environ.get("MUSE2API_SUBSCRIPTION_ACTION", "").strip():
+            return
+        path = self._action_id_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"id": action_id}, fh)
+        os.replace(tmp, path)
+
+    def read_subscription(self, cookies: dict, expires: dict | None = None,
+                          proxy: dict | None = None) -> dict:
+        """Read one account's usage without opening the settings panel."""
+        action_id = self._load_action_id()
+        try:
+            parsed = self._post_subscription(cookies, action_id, proxy)
+        except MuseAuthError:
+            raise
+        except MuseGenerationError:
+            discovered = self._discover_action_id(cookies, proxy)
+            if not discovered or discovered == action_id:
+                raise
+            parsed = self._post_subscription(cookies, discovered, proxy)
+            action_id = discovered
+        self._save_action_id(action_id)
+        return parsed
+
+    def _post_subscription(self, cookies: dict, action_id: str,
+                           proxy: dict | None) -> dict:
+        import requests
+        with request_proxy_context(proxy) as proxy_options:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+                "Origin": "https://muse.ai",
+                "Referer": "https://muse.ai/thread/new",
+                "Accept": "text/x-component",
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Next-Action": action_id,
+                "Next-Url": "/thread/new",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "Cookie": "; ".join(f"{k}={v}" for k, v in (cookies or {}).items() if v),
+            }
+            try:
+                response = requests.post(
+                    "https://muse.ai/thread/new", headers=headers,
+                    data='[{"includeAgreement":true}]', timeout=12,
+                    allow_redirects=False, **proxy_options)
+            except requests.RequestException as exc:
+                if proxy:
+                    raise MuseProxyError(
+                        f"账号代理请求失败 ({type(exc).__name__})；请检查代理连接或认证，未回退直连") from None
+                raise MuseGenerationError(
+                    f"额度接口网络请求失败 ({type(exc).__name__})") from None
+        if proxy and response.status_code == 407:
+            raise MuseProxyError("账号代理认证失败 (HTTP 407)，请检查代理用户名和密码")
+        if response.status_code == 401:
+            raise MuseAuthError("会话认证失败（额度接口 HTTP 401），请重新导入 cookie")
+        if response.status_code != 200 or "percentUsed" not in response.text:
+            raise MuseGenerationError(f"额度接口 HTTP {response.status_code}，未读到用量")
+        parsed = self.parse_subscription_payload(response.text)
+        if not parsed.get("found"):
+            raise MuseGenerationError("额度接口没有返回有效用量")
+        return parsed
+
+    def _discover_action_id(self, cookies: dict, proxy: dict | None) -> str:
+        """Find fetchSubscriptionAction in the current Muse frontend bundles."""
+        import requests
+        with request_proxy_context(proxy) as proxy_options:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+                "Cookie": "; ".join(f"{k}={v}" for k, v in (cookies or {}).items() if v),
+            }
+            try:
+                page = requests.get("https://muse.ai/thread/new", headers=headers,
+                                    timeout=12, **proxy_options)
+            except requests.RequestException:
+                return ""
+        urls = []
+        for match in re.findall(r'src="(/_next/static/[^"]+\.js)"', page.text or ""):
+            if match not in urls:
+                urls.append(match)
+        seen = set(urls)
+        index = 0
+        while index < len(urls) and index < 140:
+            url = urls[index]
+            index += 1
+            try:
+                text = requests.get("https://muse.ai" + url, timeout=12).text
+            except requests.RequestException:
+                continue
+            found = self._SUBSCRIPTION_ACTION_RE.search(text)
+            if found:
+                return found.group(1)
+            for extra in re.findall(r'/_next/static/immutable/chunks/[A-Za-z0-9_.-]+\.js', text):
+                if extra not in seen and len(urls) < 140:
+                    seen.add(extra)
+                    urls.append(extra)
+        return ""
+
+    def _remember_action_from_page(self):
+        """After the settings panel loads, keep the action id for the next HTTP read."""
+        if not self.page:
+            return
+        try:
+            raw = self.page.js(
+                "JSON.stringify(performance.getEntriesByType('resource')"
+                ".map(function(e){return e.name;})"
+                ".filter(function(n){return n.indexOf('/_next/static/')>=0 && n.endsWith('.js');}))"
+            ) or "[]"
+            urls = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        import requests
+        for url in urls:
+            if not isinstance(url, str) or "/_next/static/" not in url:
+                continue
+            try:
+                text = requests.get(url, timeout=8).text
+            except requests.RequestException:
+                continue
+            found = self._SUBSCRIPTION_ACTION_RE.search(text)
+            if found:
+                self._save_action_id(found.group(1))
+                return
+
+    @staticmethod
+    def parse_subscription_payload(text: str) -> dict:
+        """Parse the RSC flight body of fetchSubscriptionAction."""
+        data = None
+        for line in (text or "").splitlines():
+            if line.startswith("1:"):
+                try:
+                    data = json.loads(line[2:])
+                except ValueError:
+                    data = None
+                break
+        sub = data.get("subscription") if isinstance(data, dict) else None
+        if not isinstance(sub, dict):
+            return {"found": False}
+        usage = sub.get("usage") if isinstance(sub.get("usage"), dict) else {}
+        tier = sub.get("tier") if isinstance(sub.get("tier"), dict) else {}
+        percent = _finite_number(usage.get("percentUsed"))
+        balance = _whole_number(sub.get("topupBalance"))
+        total = _whole_number(sub.get("topupTotal"))
+        extra_pct = None
+        if balance is not None and total:
+            extra_pct = round(max(0, total - balance) * 100 / total, 2)
+        out = {
+            "source": "subscription",
+            "plan": sub.get("usageRowLabel") or tier.get("name") or "",
+            "weekly_reset": sub.get("statusSubtitle") or "",
+            "weekly_resets_at": _whole_number(usage.get("resetsAt")),
+            "weekly_used_pct": percent,
+            "quota_status": usage.get("quotaStatus") or "",
+            "extra_left": sub.get("topupRowValueLabel") or "",
+            "extra_balance": balance,
+            "extra_total": total,
+            "extra_used_pct": extra_pct,
+        }
+        if sub.get("topupRowLabel"):
+            out["extra_expires"] = "never"
+        out["found"] = percent is not None or balance is not None
+        return out
+
+    @staticmethod
+    def quota_exhausted(quota: dict | None) -> bool:
+        quota = quota or {}
+        status = str(quota.get("quota_status") or "").upper()
+        if status in {"EXHAUSTED", "DEPLETED", "INSUFFICIENT"}:
+            return True
+        percent = _finite_number(quota.get("weekly_used_pct"))
+        if percent is None or percent < 100:
+            return False
+        balance = _whole_number(quota.get("extra_balance"))
+        return balance is None or balance <= 0
+
+    @staticmethod
+    def usage_delta(account_id: str, before: dict | None, after: dict | None) -> dict:
+        before = before or {}
+        after = after or {}
+        out = {
+            "account": account_id,
+            "weekly_used_pct_before": _finite_number(before.get("weekly_used_pct")),
+            "weekly_used_pct_after": _finite_number(after.get("weekly_used_pct")),
+            "extra_balance_before": _whole_number(before.get("extra_balance")),
+            "extra_balance_after": _whole_number(after.get("extra_balance")),
+            "quota_status": after.get("quota_status") or "",
+            "checked_at": after.get("checked_at"),
+        }
+        same_window = True
+        before_reset = _whole_number(before.get("weekly_resets_at"))
+        after_reset = _whole_number(after.get("weekly_resets_at"))
+        if before_reset and after_reset and before_reset != after_reset:
+            same_window = False
+        if (same_window and out["weekly_used_pct_before"] is not None
+                and out["weekly_used_pct_after"] is not None):
+            out["weekly_delta_pct"] = out["weekly_used_pct_after"] - out["weekly_used_pct_before"]
+        if out["extra_balance_before"] is not None and out["extra_balance_after"] is not None:
+            out["extra_delta_tokens"] = out["extra_balance_before"] - out["extra_balance_after"]
         return out
 
     # ---------------- 附件（生成结果） ----------------
