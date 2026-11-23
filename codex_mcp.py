@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """stdio MCP：让 Codex / Claude Code / Cursor 调用网关的生图 / 生视频，不替换客户端自带模型。
 
-环境变量：
-  MUSE2API_BASE       网关地址，默认 http://127.0.0.1:18610
+环境变量优先读 MCP 配置里的 env（客户端启动时放进进程环境）。
+某一项没写时，才用程序旁边的 .env 补上。
+  MUSE2API_BASE       网关地址，默认 https://muse.aiia.cool。写成带 /v1 的地址也会自动去掉。
   MUSE2API_KEY        必填，网关 API 密钥
-  MUSE2API_MEDIA_DIR  成品目录，默认 <本仓库>/data/media
+  MUSE2API_ENV_FILE   可选。指定用来补空项的 .env，不会覆盖 MCP 配置里已经写的值。
+  MUSE2API_MEDIA_DIR  成品目录。本机能看到文件时才填本地路径，默认放在程序旁边的 data/media。
   MUSE2API_IMAGE_WAIT 生图最长等待秒数，默认 420
   MUSE2API_VIDEO_WAIT 生视频最长等待秒数，默认 600
 """
@@ -22,12 +24,80 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import unquote, urljoin
 
-BASE = os.environ.get("MUSE2API_BASE", "http://127.0.0.1:18610").rstrip("/")
+
+def normalize_base(value: str) -> str:
+    base = value.strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base
+
+
+def install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    found: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return found
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[7:].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if name:
+            found[name] = value
+    return found
+
+
+def load_env_file() -> None:
+    """只补 MCP 配置 env 里没写的项。进程里已有的值来自 MCP 配置，不覆盖。"""
+    explicit = os.environ.get("MUSE2API_ENV_FILE", "").strip()
+    paths: list[Path] = []
+    if explicit:
+        paths.append(Path(explicit).expanduser())
+    paths.append(install_dir() / ".env")
+    paths.append(Path.cwd() / ".env")
+    merged: dict[str, str] = {}
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        for name, value in parse_env_file(path).items():
+            merged.setdefault(name, value)
+    names = (
+        "MUSE2API_BASE",
+        "MUSE2API_KEY",
+        "MUSE2API_MEDIA_DIR",
+        "MUSE2API_IMAGE_WAIT",
+        "MUSE2API_VIDEO_WAIT",
+    )
+    for name in names:
+        if not os.environ.get(name, "").strip() and merged.get(name, "").strip():
+            os.environ[name] = merged[name].strip()
+    if not os.environ.get("MUSE2API_BASE", "").strip() and merged.get("GATEWAY_PUBLIC_BASE", "").strip():
+        os.environ["MUSE2API_BASE"] = merged["GATEWAY_PUBLIC_BASE"].strip()
+
+
+load_env_file()
+BASE = normalize_base(os.environ.get("MUSE2API_BASE", "https://muse.aiia.cool"))
 KEY = os.environ.get("MUSE2API_KEY", "").strip()
-MEDIA_DIR = Path(
-    os.environ.get("MUSE2API_MEDIA_DIR")
-    or Path(__file__).resolve().parent / "data" / "media"
-)
+MEDIA_DIR = Path(os.environ.get("MUSE2API_MEDIA_DIR") or install_dir() / "data" / "media")
 IMAGE_WAIT = int(os.environ.get("MUSE2API_IMAGE_WAIT", "420"))
 VIDEO_WAIT = int(os.environ.get("MUSE2API_VIDEO_WAIT", "600"))
 DONE = {"completed", "succeeded", "success", "done"}
@@ -94,6 +164,22 @@ def tool_text(payload: dict, is_error: bool = False) -> dict:
     }
 
 
+def error_text(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        detail = parsed.get("detail", raw)
+        if isinstance(detail, list):
+            return "; ".join(str(item) for item in detail)
+        return str(detail)
+    return raw
+
+
 def api(method: str, path: str, body: dict | None = None, timeout: int = 60) -> dict:
     if not KEY:
         raise RuntimeError("未设置 MUSE2API_KEY")
@@ -112,17 +198,10 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 60) -> 
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        try:
-            parsed = json.loads(detail)
-            detail = parsed.get("detail", detail)
-            if isinstance(detail, list):
-                detail = "; ".join(str(item) for item in detail)
-        except json.JSONDecodeError:
-            pass
+        detail = error_text(exc.read().decode("utf-8", "replace"))
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"连不上 muse2api（{BASE}）：{exc.reason}") from exc
+        raise RuntimeError(f"连不上网关（{BASE}）：{exc.reason}") from exc
     if not raw:
         return {}
     return json.loads(raw)
@@ -349,7 +428,7 @@ TOOLS = {
 SCHEMAS = [
     {
         "name": "muse_image",
-        "description": "用本机 muse2api 文生图，或带参考图生图。等待完成后返回本地文件路径。若返回 pending，用同一个 task_id 再调本工具，不要重新提交。",
+        "description": "用网关文生图，或带参考图生图。完成后返回图片链接。若返回 pending，用同一个 task_id 再调本工具，不要重新提交。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -364,7 +443,7 @@ SCHEMAS = [
     },
     {
         "name": "muse_image_edit",
-        "description": "用参考图做图生图 / 编辑。至少一张参考图。完成后返回本地文件路径。pending 时用 task_id 再调本工具。",
+        "description": "用参考图做图生图 / 编辑。至少一张参考图。完成后返回图片链接。pending 时用 task_id 再调本工具。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -379,7 +458,7 @@ SCHEMAS = [
     },
     {
         "name": "muse_video",
-        "description": "用本机 muse2api 提交文生视频或图生视频，并轮询到结束或超时。参考图的第一张作为起始画面。不要换成别的视频模型。",
+        "description": "用网关提交文生视频或图生视频，并轮询到结束或超时。参考图的第一张作为起始画面。不要换成别的视频模型。",
         "inputSchema": {
             "type": "object",
             "properties": {
